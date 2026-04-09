@@ -2,12 +2,7 @@
 set -e
 
 # IncusAPI One-Click Installer
-# Installs everything on a clean Debian/Ubuntu/RHEL machine:
-#   1. System dependencies (curl, jq)
-#   2. Incus (if not present)
-#   3. Incus initial setup (storage pool, network)
-#   4. IncusAPI binary + config + systemd service
-#   5. Firewall rules
+# Works on a clean Debian/Ubuntu/RHEL machine, also handles reinstall.
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash
@@ -32,6 +27,7 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${BLUE}[$1/$TOTAL_STEPS]${NC} $2"; }
 
 TOTAL_STEPS=5
+CLEAN_INSTALL=true
 
 # ─────────────────────────────────────────────────────────
 # Pre-checks
@@ -51,13 +47,58 @@ else
 fi
 info "Detected OS: $OS_ID $OS_VERSION ($(uname -m))"
 
-# Detect architecture
 ARCH=$(uname -m)
 case $ARCH in
     x86_64)  ARCH="amd64" ;;
     aarch64) ARCH="arm64" ;;
     *) error "Unsupported architecture: $ARCH" ;;
 esac
+
+# ─── Detect existing installation ────────────────────────
+
+if [ -f "$INSTALL_DIR/$APP_NAME" ] || [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$CONFIG_DIR/config.yaml" ]; then
+    echo ""
+    warn "Existing IncusAPI installation detected."
+    echo ""
+    echo "  Choose an option:"
+    echo "    1) Clean reinstall  - remove ALL old config, database, and passwords"
+    echo "    2) Upgrade only     - keep config and database, only replace binary"
+    echo "    3) Cancel"
+    echo ""
+
+    # Support piped input (non-interactive) - default to upgrade
+    if [ -t 0 ]; then
+        read -p "  Enter choice [1/2/3]: " REINSTALL_CHOICE
+    else
+        REINSTALL_CHOICE="1"
+        info "Non-interactive mode: defaulting to clean reinstall"
+    fi
+
+    case "$REINSTALL_CHOICE" in
+        1)
+            info "Clean reinstall selected. Removing old data..."
+            systemctl stop incusapi 2>/dev/null || true
+            rm -rf "$DATA_DIR/incusapi.db"
+            rm -f "$CONFIG_DIR/config.yaml"
+            # Clear old journal logs so password grep is accurate
+            journalctl --rotate 2>/dev/null || true
+            journalctl --vacuum-time=1s --unit=incusapi 2>/dev/null || true
+            CLEAN_INSTALL=true
+            info "Old data removed"
+            ;;
+        2)
+            info "Upgrade selected. Keeping config and database."
+            systemctl stop incusapi 2>/dev/null || true
+            CLEAN_INSTALL=false
+            ;;
+        3|*)
+            info "Cancelled."
+            exit 0
+            ;;
+    esac
+else
+    info "Fresh installation"
+fi
 
 # ─────────────────────────────────────────────────────────
 step 1 "Installing system dependencies"
@@ -77,7 +118,7 @@ install_pkg() {
     fi
 }
 
-for pkg in curl jq wget; do
+for pkg in curl jq wget file; do
     if ! command -v $pkg &>/dev/null; then
         info "Installing $pkg..."
         install_pkg $pkg
@@ -97,14 +138,12 @@ else
 
     case "$OS_ID" in
         debian|ubuntu|linuxmint|pop)
-            # Zabbly repo (official recommended method)
             if [ ! -f /etc/apt/sources.list.d/zabbly-incus-stable.sources ] && \
                [ ! -f /etc/apt/sources.list.d/zabbly-incus-stable.list ]; then
                 curl -fsSL https://pkgs.zabbly.com/get/incus-stable | bash 2>&1 | tail -5
             fi
             ;;
         centos|rhel|rocky|almalinux|fedora)
-            # COPR repo for RHEL-based
             if command -v dnf &>/dev/null; then
                 dnf copr enable -y neil/incus 2>/dev/null || true
                 dnf install -y incus incus-client 2>&1 | tail -5
@@ -114,7 +153,7 @@ else
             ;;
         *)
             warn "Auto-install not supported for $OS_ID."
-            warn "Please install Incus manually: https://linuxcontainers.org/incus/docs/main/installing/"
+            warn "Install Incus manually: https://linuxcontainers.org/incus/docs/main/installing/"
             ;;
     esac
 
@@ -122,19 +161,16 @@ else
         INCUS_VER=$(incus version 2>/dev/null || echo "unknown")
         info "Incus installed: $INCUS_VER"
     else
-        warn "Incus installation may have failed. IncusAPI will start but Incus features won't work."
+        warn "Incus installation may have failed. IncusAPI will run but Incus features won't work."
     fi
 fi
 
-# ─── Incus initial setup (if not already initialized) ───
+# ─── Incus initial setup ─────────────────────────────────
 
 if command -v incus &>/dev/null; then
-    # Check if Incus has any storage pool (sign of initialization)
     POOLS=$(incus storage list --format csv 2>/dev/null | wc -l)
     if [ "$POOLS" -eq 0 ]; then
         info "Initializing Incus with default settings..."
-
-        # Use preseed for non-interactive setup
         cat <<PRESEED | incus admin init --preseed 2>/dev/null || true
 config: {}
 networks:
@@ -176,7 +212,6 @@ step 3 "Installing IncusAPI binary"
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 BINARY_PATH="$INSTALL_DIR/$APP_NAME"
 
-# Stop old instance
 systemctl stop incusapi 2>/dev/null || true
 
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/incusapi-linux-${ARCH}"
@@ -184,11 +219,11 @@ info "Downloading incusapi-linux-${ARCH}..."
 curl -sSL -o "$BINARY_PATH" "$DOWNLOAD_URL" || error "Download failed from $DOWNLOAD_URL"
 chmod +x "$BINARY_PATH"
 
-# Verify
+# Verify binary is valid ELF
 if ! file "$BINARY_PATH" | grep -q "ELF"; then
-    file "$BINARY_PATH"
+    FTYPE=$(file "$BINARY_PATH")
     rm -f "$BINARY_PATH"
-    error "Downloaded file is not a valid binary."
+    error "Downloaded file is not a valid Linux binary: $FTYPE"
 fi
 
 SIZE=$(du -h "$BINARY_PATH" | awk '{print $1}')
@@ -270,15 +305,27 @@ if command -v iptables &>/dev/null; then
     fi
 fi
 
-# Start
+# Start service and wait for it to initialize
 systemctl start incusapi
-sleep 2
+sleep 3
 
-if systemctl is-active --quiet incusapi; then
-    info "Service is running!"
-else
-    warn "Service may not have started correctly."
-    journalctl -u incusapi -n 10 --no-pager
+if ! systemctl is-active --quiet incusapi; then
+    echo ""
+    warn "Service failed to start. Recent logs:"
+    journalctl -u incusapi -n 15 --no-pager
+    error "Please check the logs above and fix the issue."
+fi
+
+info "Service is running!"
+
+# ─── Extract password from THIS run's logs ───────────────
+
+# Get the password from the most recent startup (not old logs)
+ADMIN_PW=""
+if [ "$CLEAN_INSTALL" = true ]; then
+    # Read recent logs (last 30 seconds) to get the newly generated password
+    ADMIN_PW=$(journalctl -u incusapi --since "30 seconds ago" --no-pager 2>/dev/null \
+        | grep -oP 'Password: \K\S+' | tail -1)
 fi
 
 # ─── Result ──────────────────────────────────────────────
@@ -286,21 +333,25 @@ fi
 SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [ -z "$SERVER_IP" ] && SERVER_IP="<server-ip>"
 
-ADMIN_PW=$(journalctl -u incusapi --no-pager 2>/dev/null | grep -oP 'Password: \K\S+' | tail -1)
-
 echo ""
 echo "════════════════════════════════════════════"
 echo "  IncusAPI installed successfully!"
 echo ""
 echo "  Web UI:     http://${SERVER_IP}:${PORT}"
-echo "  Username:   admin"
-if [ -n "$ADMIN_PW" ]; then
-echo "  Password:   $ADMIN_PW"
+echo ""
+if [ "$CLEAN_INSTALL" = true ]; then
+    echo "  Username:   admin"
+    if [ -n "$ADMIN_PW" ]; then
+        echo "  Password:   $ADMIN_PW"
+    else
+        echo "  Password:   (check logs: journalctl -u incusapi | grep Password)"
+    fi
 else
-echo "  Password:   journalctl -u incusapi | grep Password"
+    echo "  (Upgrade: using existing database and credentials)"
 fi
 echo ""
 echo "  Config:     $CONFIG_DIR/config.yaml"
+echo "  Database:   $DATA_DIR/incusapi.db"
 echo "  Logs:       journalctl -u incusapi -f"
 echo ""
 echo "  Management:"
