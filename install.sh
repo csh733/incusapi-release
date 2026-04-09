@@ -80,6 +80,7 @@ if [ -f "$INSTALL_DIR/$APP_NAME" ] || [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$C
             info "Clean reinstall selected. Removing old data..."
             systemctl stop incusapi 2>/dev/null || true
             rm -f "$DATA_DIR/incusapi.db"
+            rm -f "$DATA_DIR/.initial_credentials"
             rm -f "$CONFIG_DIR/config.yaml"
             journalctl --rotate 2>/dev/null || true
             journalctl --vacuum-time=1s --unit=incusapi 2>/dev/null || true
@@ -316,13 +317,16 @@ fi
 
 info "Service is running!"
 
-# ─── Extract password from THIS run only ─────────────────
+# ─── Read credentials from file ──────────────────────────
 
+CRED_FILE="$DATA_DIR/.initial_credentials"
+ADMIN_USER=""
 ADMIN_PW=""
-if [ "$CLEAN_INSTALL" = true ]; then
-    # Only look at logs since we started the service
-    ADMIN_PW=$(journalctl -u incusapi --since "$START_TIME" --no-pager 2>/dev/null \
-        | grep "Password:" | head -1 | sed 's/.*Password: //')
+if [ "$CLEAN_INSTALL" = true ] && [ -f "$CRED_FILE" ]; then
+    ADMIN_USER=$(sed -n '1p' "$CRED_FILE")
+    ADMIN_PW=$(sed -n '2p' "$CRED_FILE")
+    # Remove credentials file after reading
+    rm -f "$CRED_FILE"
 fi
 
 # ─── Result ──────────────────────────────────────────────
