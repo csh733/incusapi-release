@@ -31,14 +31,14 @@ TOTAL_STEPS=5
 # ─── If piped (curl|bash), re-download and re-exec from file ──
 
 if [ ! -t 0 ]; then
-    TMP_SCRIPT=$(mktemp /tmp/incusapi-install.XXXXXX.sh)
-    curl -sSL "$RAW_URL" -o "$TMP_SCRIPT" 2>/dev/null || true
+    # stdin is a pipe (curl|bash). Re-download to file and re-exec so stdin is tty.
+    TMP_SCRIPT="/tmp/incusapi-install-$$.sh"
+    curl -sSL "$RAW_URL" -o "$TMP_SCRIPT" 2>/dev/null
     if [ -s "$TMP_SCRIPT" ]; then
-        exec bash "$TMP_SCRIPT" "$@"
-    else
-        # Fallback: already have the script in memory, just no tty
-        warn "Could not re-download script. Interactive prompts may not work."
+        chmod +x "$TMP_SCRIPT"
+        exec bash "$TMP_SCRIPT" "$@" < /dev/tty
     fi
+    warn "Non-interactive mode: defaulting to clean install"
 fi
 
 # ─── Pre-checks ──────────────────────────────────────────
