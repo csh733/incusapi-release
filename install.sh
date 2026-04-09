@@ -29,7 +29,8 @@ step()  { echo -e "\n${BLUE}[$1/$TOTAL_STEPS]${NC} $2"; }
 ask() {
     # $1=prompt $2=default
     local reply
-    read -p "$1" reply </dev/tty 2>/dev/null || reply="$2"
+    echo -n "$1" >/dev/tty
+    read reply </dev/tty 2>/dev/null || reply="$2"
     [ -z "$reply" ] && reply="$2"
     echo "$reply"
 }
