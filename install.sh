@@ -2,10 +2,13 @@
 set -e
 
 # IncusAPI One-Click Installer
-# Works on a clean Debian/Ubuntu/RHEL machine, also handles reinstall.
 #
-# Usage (two-step to support interactive prompts):
-#   curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh -o /tmp/incusapi-install.sh && sudo bash /tmp/incusapi-install.sh
+# Usage:
+#   Fresh install / Clean reinstall (removes old data):
+#     curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash
+#
+#   Upgrade only (keep config & database):
+#     curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash -s -- --upgrade
 
 APP_NAME="incusapi"
 REPO="csh733/incusapi-release"
@@ -26,27 +29,31 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${BLUE}[$1/$TOTAL_STEPS]${NC} $2"; }
 
-ask() {
-    # $1=prompt $2=default
-    local reply
-    echo -n "$1" >/dev/tty
-    read reply </dev/tty 2>/dev/null || reply="$2"
-    [ -z "$reply" ] && reply="$2"
-    echo "$reply"
-}
-
 TOTAL_STEPS=5
-CLEAN_INSTALL=true
 
-# ─────────────────────────────────────────────────────────
-# Pre-checks
-# ─────────────────────────────────────────────────────────
+# ─── Parse arguments ─────────────────────────────────────
+
+MODE="clean"
+for arg in "$@"; do
+    case "$arg" in
+        --upgrade) MODE="upgrade" ;;
+        --clean)   MODE="clean" ;;
+        --help|-h)
+            echo "Usage:"
+            echo "  bash install.sh           # Fresh/clean install (default)"
+            echo "  bash install.sh --upgrade # Keep config & database, only replace binary"
+            echo "  bash install.sh --clean   # Remove all old data and reinstall"
+            exit 0
+            ;;
+    esac
+done
+
+# ─── Pre-checks ──────────────────────────────────────────
 
 if [ "$(id -u)" -ne 0 ]; then
-    error "Please run as root:\n  sudo bash $0"
+    error "Please run as root (sudo)"
 fi
 
-# Detect OS
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_ID="$ID"
@@ -63,41 +70,20 @@ case $ARCH in
     *) error "Unsupported architecture: $ARCH" ;;
 esac
 
-# ─── Detect existing installation ────────────────────────
+# ─── Handle existing installation ────────────────────────
 
-if [ -f "$INSTALL_DIR/$APP_NAME" ] || [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$CONFIG_DIR/config.yaml" ]; then
-    echo ""
-    warn "Existing IncusAPI installation detected."
-    echo ""
-    echo "  1) Clean reinstall  - remove ALL old config, database, and passwords"
-    echo "  2) Upgrade only     - keep config and database, only replace binary"
-    echo "  3) Cancel"
-    echo ""
-
-    CHOICE=$(ask "  Enter choice [1/2/3] (default: 2): " "2")
-
-    case "$CHOICE" in
-        1)
-            info "Clean reinstall selected. Removing old data..."
-            systemctl stop incusapi 2>/dev/null || true
-            rm -f "$DATA_DIR/incusapi.db"
-            rm -f "$DATA_DIR/.initial_credentials"
-            rm -f "$CONFIG_DIR/config.yaml"
-            journalctl --rotate 2>/dev/null || true
-            journalctl --vacuum-time=1s --unit=incusapi 2>/dev/null || true
-            CLEAN_INSTALL=true
-            info "Old data removed"
-            ;;
-        2)
-            info "Upgrade selected. Keeping config and database."
-            systemctl stop incusapi 2>/dev/null || true
-            CLEAN_INSTALL=false
-            ;;
-        3|*)
-            info "Cancelled."
-            exit 0
-            ;;
-    esac
+if [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$CONFIG_DIR/config.yaml" ]; then
+    if [ "$MODE" = "clean" ]; then
+        warn "Existing installation found. Clean reinstall: removing old data..."
+        systemctl stop incusapi 2>/dev/null || true
+        rm -f "$DATA_DIR/incusapi.db"
+        rm -f "$DATA_DIR/.initial_credentials"
+        rm -f "$CONFIG_DIR/config.yaml"
+        info "Old config and database removed"
+    else
+        info "Upgrade mode: keeping existing config and database"
+        systemctl stop incusapi 2>/dev/null || true
+    fi
 else
     info "Fresh installation"
 fi
@@ -304,8 +290,6 @@ if command -v iptables &>/dev/null; then
     fi
 fi
 
-# Record time before starting, so we can grep only new logs
-START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl start incusapi
 sleep 3
 
@@ -318,15 +302,14 @@ fi
 
 info "Service is running!"
 
-# ─── Read credentials from file ──────────────────────────
+# ─── Read credentials ────────────────────────────────────
 
 CRED_FILE="$DATA_DIR/.initial_credentials"
 ADMIN_USER=""
 ADMIN_PW=""
-if [ "$CLEAN_INSTALL" = true ] && [ -f "$CRED_FILE" ]; then
+if [ -f "$CRED_FILE" ]; then
     ADMIN_USER=$(sed -n '1p' "$CRED_FILE")
     ADMIN_PW=$(sed -n '2p' "$CRED_FILE")
-    # Remove credentials file after reading
     rm -f "$CRED_FILE"
 fi
 
@@ -341,28 +324,19 @@ echo "  IncusAPI installed successfully!"
 echo ""
 echo "  Web UI:     http://${SERVER_IP}:${PORT}"
 echo ""
-if [ "$CLEAN_INSTALL" = true ]; then
-    echo "  Username:   admin"
-    if [ -n "$ADMIN_PW" ]; then
-        echo "  Password:   $ADMIN_PW"
-    else
-        echo "  Password:   run: journalctl -u incusapi --since \"$START_TIME\" | grep Password"
-    fi
-else
+if [ -n "$ADMIN_PW" ]; then
+    echo "  Username:   ${ADMIN_USER}"
+    echo "  Password:   ${ADMIN_PW}"
+elif [ "$MODE" = "upgrade" ]; then
     echo "  (Upgrade mode: credentials unchanged)"
+else
+    echo "  (Credentials unchanged — database already existed)"
 fi
 echo ""
 echo "  Config:     $CONFIG_DIR/config.yaml"
 echo "  Database:   $DATA_DIR/incusapi.db"
 echo "  Logs:       journalctl -u incusapi -f"
 echo ""
-echo "  Management:"
-echo "    systemctl restart incusapi"
-echo "    systemctl stop incusapi"
-echo ""
-echo "  Reinstall/Upgrade:"
-echo "    curl -sSL https://raw.githubusercontent.com/${REPO}/master/install.sh -o /tmp/incusapi-install.sh && sudo bash /tmp/incusapi-install.sh"
-echo ""
-echo "  Uninstall:"
-echo "    curl -sSL https://raw.githubusercontent.com/${REPO}/master/uninstall.sh -o /tmp/incusapi-uninstall.sh && sudo bash /tmp/incusapi-uninstall.sh"
+echo "  Upgrade:    curl -sSL ...install.sh | sudo bash -s -- --upgrade"
+echo "  Uninstall:  curl -sSL ...uninstall.sh | sudo bash"
 echo "════════════════════════════════════════════"
