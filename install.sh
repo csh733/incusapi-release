@@ -4,14 +4,11 @@ set -e
 # IncusAPI One-Click Installer
 #
 # Usage:
-#   Fresh install / Clean reinstall (removes old data):
-#     curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash
-#
-#   Upgrade only (keep config & database):
-#     curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash -s -- --upgrade
+#   curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash
 
 APP_NAME="incusapi"
 REPO="csh733/incusapi-release"
+RAW_URL="https://raw.githubusercontent.com/${REPO}/master/install.sh"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/incusapi"
 DATA_DIR="/var/lib/incusapi"
@@ -31,22 +28,18 @@ step()  { echo -e "\n${BLUE}[$1/$TOTAL_STEPS]${NC} $2"; }
 
 TOTAL_STEPS=5
 
-# ─── Parse arguments ─────────────────────────────────────
+# ─── If piped (curl|bash), re-download and re-exec from file ──
 
-MODE="clean"
-for arg in "$@"; do
-    case "$arg" in
-        --upgrade) MODE="upgrade" ;;
-        --clean)   MODE="clean" ;;
-        --help|-h)
-            echo "Usage:"
-            echo "  bash install.sh           # Fresh/clean install (default)"
-            echo "  bash install.sh --upgrade # Keep config & database, only replace binary"
-            echo "  bash install.sh --clean   # Remove all old data and reinstall"
-            exit 0
-            ;;
-    esac
-done
+if [ ! -t 0 ]; then
+    TMP_SCRIPT=$(mktemp /tmp/incusapi-install.XXXXXX.sh)
+    curl -sSL "$RAW_URL" -o "$TMP_SCRIPT" 2>/dev/null || true
+    if [ -s "$TMP_SCRIPT" ]; then
+        exec bash "$TMP_SCRIPT" "$@"
+    else
+        # Fallback: already have the script in memory, just no tty
+        warn "Could not re-download script. Interactive prompts may not work."
+    fi
+fi
 
 # ─── Pre-checks ──────────────────────────────────────────
 
@@ -72,18 +65,40 @@ esac
 
 # ─── Handle existing installation ────────────────────────
 
-if [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$CONFIG_DIR/config.yaml" ]; then
-    if [ "$MODE" = "clean" ]; then
-        warn "Existing installation found. Clean reinstall: removing old data..."
-        systemctl stop incusapi 2>/dev/null || true
-        rm -f "$DATA_DIR/incusapi.db"
-        rm -f "$DATA_DIR/.initial_credentials"
-        rm -f "$CONFIG_DIR/config.yaml"
-        info "Old config and database removed"
-    else
-        info "Upgrade mode: keeping existing config and database"
-        systemctl stop incusapi 2>/dev/null || true
-    fi
+CLEAN_INSTALL=true
+
+if [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$CONFIG_DIR/config.yaml" ] || [ -f "$INSTALL_DIR/$APP_NAME" ]; then
+    echo ""
+    warn "Existing IncusAPI installation detected."
+    echo ""
+    echo "  1) Clean reinstall  - remove ALL old config, database, and passwords"
+    echo "  2) Upgrade only     - keep config and database, only replace binary"
+    echo "  3) Cancel"
+    echo ""
+    read -p "  Enter choice [1/2/3]: " CHOICE
+    echo ""
+
+    case "$CHOICE" in
+        1)
+            info "Clean reinstall: removing old data..."
+            systemctl stop incusapi 2>/dev/null || true
+            sleep 1
+            rm -f "$DATA_DIR/incusapi.db"
+            rm -f "$DATA_DIR/.initial_credentials"
+            rm -f "$CONFIG_DIR/config.yaml"
+            CLEAN_INSTALL=true
+            info "Old config and database removed"
+            ;;
+        2)
+            info "Upgrade mode: keeping config and database"
+            systemctl stop incusapi 2>/dev/null || true
+            CLEAN_INSTALL=false
+            ;;
+        3|*)
+            info "Cancelled."
+            exit 0
+            ;;
+    esac
 else
     info "Fresh installation"
 fi
@@ -149,7 +164,7 @@ else
         INCUS_VER=$(incus version 2>/dev/null || echo "unknown")
         info "Incus installed: $INCUS_VER"
     else
-        warn "Incus installation may have failed. IncusAPI will run but Incus features won't work."
+        warn "Incus install may have failed. IncusAPI will run but Incus features won't work."
     fi
 fi
 
@@ -290,6 +305,12 @@ if command -v iptables &>/dev/null; then
     fi
 fi
 
+# Verify DB does not exist before starting (clean install should have deleted it)
+if [ "$CLEAN_INSTALL" = true ] && [ -f "$DATA_DIR/incusapi.db" ]; then
+    warn "Database still exists after clean — force removing"
+    rm -f "$DATA_DIR/incusapi.db"
+fi
+
 systemctl start incusapi
 sleep 3
 
@@ -302,11 +323,17 @@ fi
 
 info "Service is running!"
 
-# ─── Read credentials ────────────────────────────────────
+# ─── Read credentials from file ──────────────────────────
 
 CRED_FILE="$DATA_DIR/.initial_credentials"
 ADMIN_USER=""
 ADMIN_PW=""
+
+# Wait a moment for the program to write the file
+if [ "$CLEAN_INSTALL" = true ] && [ ! -f "$CRED_FILE" ]; then
+    sleep 2
+fi
+
 if [ -f "$CRED_FILE" ]; then
     ADMIN_USER=$(sed -n '1p' "$CRED_FILE")
     ADMIN_PW=$(sed -n '2p' "$CRED_FILE")
@@ -327,16 +354,20 @@ echo ""
 if [ -n "$ADMIN_PW" ]; then
     echo "  Username:   ${ADMIN_USER}"
     echo "  Password:   ${ADMIN_PW}"
-elif [ "$MODE" = "upgrade" ]; then
+elif [ "$CLEAN_INSTALL" = false ]; then
     echo "  (Upgrade mode: credentials unchanged)"
 else
-    echo "  (Credentials unchanged — database already existed)"
+    echo "  (Could not read credentials. Try: journalctl -u incusapi | grep Password)"
 fi
 echo ""
 echo "  Config:     $CONFIG_DIR/config.yaml"
 echo "  Database:   $DATA_DIR/incusapi.db"
 echo "  Logs:       journalctl -u incusapi -f"
 echo ""
-echo "  Upgrade:    curl -sSL ...install.sh | sudo bash -s -- --upgrade"
-echo "  Uninstall:  curl -sSL ...uninstall.sh | sudo bash"
+echo "  Management:"
+echo "    systemctl restart incusapi"
+echo "    systemctl stop incusapi"
 echo "════════════════════════════════════════════"
+
+# Cleanup temp script if we re-downloaded ourselves
+[ -n "$TMP_SCRIPT" ] && rm -f "$TMP_SCRIPT" 2>/dev/null
