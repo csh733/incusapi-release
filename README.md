@@ -7,7 +7,7 @@ Incus web management system with API. Single binary, installs directly on the ho
 Run on a fresh **Debian/Ubuntu** or **RHEL/CentOS** machine:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh -o /tmp/incusapi-install.sh && sudo bash /tmp/incusapi-install.sh
 ```
 
 This automatically installs:
@@ -34,7 +34,7 @@ After install, access the web UI at `http://SERVER_IP:8080`.
 ## Uninstall
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/uninstall.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/uninstall.sh -o /tmp/incusapi-uninstall.sh && sudo bash /tmp/incusapi-uninstall.sh
 ```
 
 ## Supported Platforms

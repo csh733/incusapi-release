@@ -4,8 +4,8 @@ set -e
 # IncusAPI One-Click Installer
 # Works on a clean Debian/Ubuntu/RHEL machine, also handles reinstall.
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh | sudo bash
+# Usage (two-step to support interactive prompts):
+#   curl -sSL https://raw.githubusercontent.com/csh733/incusapi-release/master/install.sh -o /tmp/incusapi-install.sh && sudo bash /tmp/incusapi-install.sh
 
 APP_NAME="incusapi"
 REPO="csh733/incusapi-release"
@@ -26,6 +26,14 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${BLUE}[$1/$TOTAL_STEPS]${NC} $2"; }
 
+ask() {
+    # $1=prompt $2=default
+    local reply
+    read -p "$1" reply </dev/tty 2>/dev/null || reply="$2"
+    [ -z "$reply" ] && reply="$2"
+    echo "$reply"
+}
+
 TOTAL_STEPS=5
 CLEAN_INSTALL=true
 
@@ -34,7 +42,7 @@ CLEAN_INSTALL=true
 # ─────────────────────────────────────────────────────────
 
 if [ "$(id -u)" -ne 0 ]; then
-    error "Please run as root:\n  curl -sSL https://raw.githubusercontent.com/${REPO}/master/install.sh | sudo bash"
+    error "Please run as root:\n  sudo bash $0"
 fi
 
 # Detect OS
@@ -60,27 +68,19 @@ if [ -f "$INSTALL_DIR/$APP_NAME" ] || [ -f "$DATA_DIR/incusapi.db" ] || [ -f "$C
     echo ""
     warn "Existing IncusAPI installation detected."
     echo ""
-    echo "  Choose an option:"
-    echo "    1) Clean reinstall  - remove ALL old config, database, and passwords"
-    echo "    2) Upgrade only     - keep config and database, only replace binary"
-    echo "    3) Cancel"
+    echo "  1) Clean reinstall  - remove ALL old config, database, and passwords"
+    echo "  2) Upgrade only     - keep config and database, only replace binary"
+    echo "  3) Cancel"
     echo ""
 
-    # Support piped input (non-interactive) - default to upgrade
-    if [ -t 0 ]; then
-        read -p "  Enter choice [1/2/3]: " REINSTALL_CHOICE
-    else
-        REINSTALL_CHOICE="1"
-        info "Non-interactive mode: defaulting to clean reinstall"
-    fi
+    CHOICE=$(ask "  Enter choice [1/2/3] (default: 2): " "2")
 
-    case "$REINSTALL_CHOICE" in
+    case "$CHOICE" in
         1)
             info "Clean reinstall selected. Removing old data..."
             systemctl stop incusapi 2>/dev/null || true
-            rm -rf "$DATA_DIR/incusapi.db"
+            rm -f "$DATA_DIR/incusapi.db"
             rm -f "$CONFIG_DIR/config.yaml"
-            # Clear old journal logs so password grep is accurate
             journalctl --rotate 2>/dev/null || true
             journalctl --vacuum-time=1s --unit=incusapi 2>/dev/null || true
             CLEAN_INSTALL=true
@@ -219,7 +219,6 @@ info "Downloading incusapi-linux-${ARCH}..."
 curl -sSL -o "$BINARY_PATH" "$DOWNLOAD_URL" || error "Download failed from $DOWNLOAD_URL"
 chmod +x "$BINARY_PATH"
 
-# Verify binary is valid ELF
 if ! file "$BINARY_PATH" | grep -q "ELF"; then
     FTYPE=$(file "$BINARY_PATH")
     rm -f "$BINARY_PATH"
@@ -259,7 +258,6 @@ else
     info "Config exists, keeping current config"
 fi
 
-# Systemd service
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=IncusAPI Web Management Server
@@ -289,7 +287,6 @@ info "Systemd service configured"
 step 5 "Opening firewall and starting service"
 # ─────────────────────────────────────────────────────────
 
-# Firewall
 if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
     ufw allow $PORT/tcp >/dev/null 2>&1 && info "ufw: port $PORT opened"
 fi
@@ -305,7 +302,8 @@ if command -v iptables &>/dev/null; then
     fi
 fi
 
-# Start service and wait for it to initialize
+# Record time before starting, so we can grep only new logs
+START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl start incusapi
 sleep 3
 
@@ -313,19 +311,18 @@ if ! systemctl is-active --quiet incusapi; then
     echo ""
     warn "Service failed to start. Recent logs:"
     journalctl -u incusapi -n 15 --no-pager
-    error "Please check the logs above and fix the issue."
+    error "Check the logs above."
 fi
 
 info "Service is running!"
 
-# ─── Extract password from THIS run's logs ───────────────
+# ─── Extract password from THIS run only ─────────────────
 
-# Get the password from the most recent startup (not old logs)
 ADMIN_PW=""
 if [ "$CLEAN_INSTALL" = true ]; then
-    # Read recent logs (last 30 seconds) to get the newly generated password
-    ADMIN_PW=$(journalctl -u incusapi --since "30 seconds ago" --no-pager 2>/dev/null \
-        | grep -oP 'Password: \K\S+' | tail -1)
+    # Only look at logs since we started the service
+    ADMIN_PW=$(journalctl -u incusapi --since "$START_TIME" --no-pager 2>/dev/null \
+        | grep "Password:" | head -1 | sed 's/.*Password: //')
 fi
 
 # ─── Result ──────────────────────────────────────────────
@@ -344,10 +341,10 @@ if [ "$CLEAN_INSTALL" = true ]; then
     if [ -n "$ADMIN_PW" ]; then
         echo "  Password:   $ADMIN_PW"
     else
-        echo "  Password:   (check logs: journalctl -u incusapi | grep Password)"
+        echo "  Password:   run: journalctl -u incusapi --since \"$START_TIME\" | grep Password"
     fi
 else
-    echo "  (Upgrade: using existing database and credentials)"
+    echo "  (Upgrade mode: credentials unchanged)"
 fi
 echo ""
 echo "  Config:     $CONFIG_DIR/config.yaml"
@@ -358,6 +355,9 @@ echo "  Management:"
 echo "    systemctl restart incusapi"
 echo "    systemctl stop incusapi"
 echo ""
+echo "  Reinstall/Upgrade:"
+echo "    curl -sSL https://raw.githubusercontent.com/${REPO}/master/install.sh -o /tmp/incusapi-install.sh && sudo bash /tmp/incusapi-install.sh"
+echo ""
 echo "  Uninstall:"
-echo "    curl -sSL https://raw.githubusercontent.com/${REPO}/master/uninstall.sh | sudo bash"
+echo "    curl -sSL https://raw.githubusercontent.com/${REPO}/master/uninstall.sh -o /tmp/incusapi-uninstall.sh && sudo bash /tmp/incusapi-uninstall.sh"
 echo "════════════════════════════════════════════"
